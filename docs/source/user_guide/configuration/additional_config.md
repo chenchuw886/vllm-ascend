@@ -72,7 +72,7 @@ Binding flow (high level):
 | Name             | Type | Default                                                     | Description                        |
 |------------------|------|-------------------------------------------------------------|------------------------------------|
 | `enabled`        | bool | `False`                                                     | Whether to enable weight prefetch. |
-| `prefetch_ratio` | dict | `{"attn": {"qkv": 1.0, "o": 1.0}, "moe": {"gate_up": 0.8}}` | Prefetch ratio of each weight.     |
+| `prefetch_ratio` | dict | `{"attn": {"qkv": 1.0, "o": 1.0}, "moe": {"gate_up": 0.8}, "mlp": { "gate_up": 1.0,  "down": 1.0}}` | Prefetch ratio of each weight.     |
 
 **finegrained_tp_config**
 
@@ -108,6 +108,9 @@ Binding flow (high level):
 |------------------------| ---- |---------|----------------------------------------------------------------------------------------|
 | `enable`               | bool | `False` | Whether to enable npugraph_ex backend.                                                 |
 | `enable_static_kernel` | bool | `False` | Whether to enable static kernel. Suitable for scenarios where shape changes are minimal and some time is available for static kernel compilation. |
+| `fuse_norm_quant`  | bool | `True` | Whether to enable fuse_norm_quant pass. |
+| `fuse_qknorm_rope` | bool | `True` | Whether to enable fuse_qknorm_rope pass. If Triton is not in the environment, set it to False. |
+| `fuse_allreduce_rms` | bool | `False` | Whether to enable fuse_allreduce_rms pass. It's set to False because of conflict with SP. |
 
 ### Example
 
@@ -124,6 +127,10 @@ An example of additional configuration is as follows:
             },
             "moe": {
                 "gate_up": 0.8
+            },
+            "mlp": {
+                "gate_up": 1.0,
+                "down": 1.0
             }
         },
     },

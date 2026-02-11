@@ -17,12 +17,18 @@
 import torch
 import torch._inductor.pattern_matcher as pm
 from torch._inductor.pattern_matcher import PatternMatcherPass, PatternPrettyPrinter
-from vllm.compilation.vllm_inductor_pass import VllmInductorPass
 from vllm.config import VllmConfig
 from vllm.config.compilation import Range
 from vllm.distributed import get_tensor_model_parallel_world_size, tensor_model_parallel_all_reduce
 from vllm.distributed.parallel_state import get_tp_group
 from vllm.logger import logger
+
+from vllm_ascend.utils import vllm_version_is
+
+if vllm_version_is("0.15.0"):
+    from vllm.compilation.vllm_inductor_pass import VllmInductorPass  # type: ignore
+else:
+    from vllm.compilation.passes.vllm_inductor_pass import VllmInductorPass
 
 # computation-communication tiling block is 512
 ALLREDUCE_NORM_FUSE_THREHOLD = 512
@@ -56,7 +62,7 @@ class MiddleLayerMatmulAllReduceAddRMSNormPattern:
         def pattern(x, weight, residual, rms_norm_weight):
             mm = torch.ops.vllm.unquantized_gemm(x, weight, None)
             all_reduce_ = tensor_model_parallel_all_reduce(mm)
-            output = torch.ops.npu.npu_add_rms_norm(all_reduce_, residual, rms_norm_weight)
+            output = torch.ops._C_ascend.npu_add_rms_norm_bias(all_reduce_, residual, rms_norm_weight, None)
             out0 = output[0]
             out1 = output[2]
 
@@ -103,7 +109,7 @@ class LastLayerMatmulAllReduceAddRMSNormPattern:
         def pattern(x, weight, residual, rms_norm_weight):
             mm = torch.ops.vllm.unquantized_gemm(x, weight, None)
             all_reduce_ = tensor_model_parallel_all_reduce(mm)
-            output = torch.ops.npu.npu_add_rms_norm(all_reduce_, residual, rms_norm_weight)
+            output = torch.ops._C_ascend.npu_add_rms_norm_bias(all_reduce_, residual, rms_norm_weight, None)
 
             return output[0]
 

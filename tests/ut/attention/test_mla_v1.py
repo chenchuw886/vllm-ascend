@@ -223,7 +223,7 @@ class TestAscendMLAMetadataBuilder(TestBase):
             )
 
         self.parent_init_patcher = patch(
-            "vllm.v1.attention.backends.mla.common.MLACommonMetadataBuilder.__init__",
+            "vllm.model_executor.layers.attention.mla_attention.MLACommonMetadataBuilder.__init__",
             mock_parent_init)
         self.parent_init_patcher.start()
 
@@ -449,7 +449,7 @@ class TestAscendMLAMetadataBuilderBuild(TestBase):
             )
 
         self.parent_init_patcher = patch(
-            "vllm.v1.attention.backends.mla.common.MLACommonMetadataBuilder.__init__",
+            "vllm.model_executor.layers.attention.mla_attention.MLACommonMetadataBuilder.__init__",
             mock_parent_init)
         self.parent_init_patcher.start()
 
@@ -967,10 +967,10 @@ class TestAscendMLAImpl(TestBase):
         mock_npu_fused_infer_attention_score.assert_called_once()
 
     @patch("torch.ops.vllm.maybe_all_gather_and_maybe_unpad")
-    @patch("vllm_ascend.attention.mla_v1.maybe_npu_prefetch")
-    def test_mla_preprocess(self, magic_npu_fetch,
+    @patch("vllm_ascend.attention.mla_v1.get_weight_prefetch_method",
+           return_value=MagicMock())
+    def test_mla_preprocess(self, mock_get_weight_prefetch_method,
                             mock_maybe_all_gather_and_maybe_unpad):
-        magic_npu_fetch.return_value = MagicMock()
         mock_maybe_all_gather_and_maybe_unpad.side_effect = lambda x, label: x
         batch_size = 4
         seq_len = 8
