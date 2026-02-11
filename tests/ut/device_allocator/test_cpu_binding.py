@@ -1,7 +1,8 @@
 import unittest
 from unittest.mock import patch
 
-from vllm_ascend.cpu_binding import CpuAlloc, DeviceInfo
+from vllm_ascend.cpu_binding import CpuAlloc, DeviceInfo, get_current_npu_id
+from vllm_ascend.utils import AscendDeviceType
 
 
 class TestDeviceInfo(unittest.TestCase):
@@ -46,16 +47,22 @@ class TestDeviceInfo(unittest.TestCase):
     @patch('vllm_ascend.cpu_binding.execute_command')
     def test_get_running_npus(self, mock_execute_command):
         mock_execute_command.side_effect = [
-            ("| NPU Chip | Process id |\n| 0 1 | 1236 | vllm | 56000 |", 0),
+            ("| NPU Chip | Process id |\n| 0 0 | 1236 | vllm | 56000 |", 0),
             ("", 0),
             ("| NPU Chip | Process id |\n| 1 0 | 1236 | vllm | 56000 |", 0)
         ]
-        with self.assertRaises(RuntimeError):
-            self.device_info.get_running_npus()
-        with self.assertRaises(RuntimeError):
-            self.device_info.get_running_npus()
         running_npus = self.device_info.get_running_npus()
-        self.assertEqual(len(running_npus), 1)
+        self.assertEqual(running_npus, [0, 1])
+        running_npus = self.device_info.get_running_npus()
+        self.assertEqual(running_npus, [0, 1])
+        running_npus = self.device_info.get_running_npus()
+        self.assertEqual(running_npus, [0, 1])
+
+    @patch('vllm_ascend.cpu_binding.execute_command')
+    def test_get_running_npus_fallback_visible(self, mock_execute_command):
+        mock_execute_command.return_value = ("| NPU Chip | Process id |", 0)
+        running_npus = self.device_info.get_running_npus()
+        self.assertEqual(running_npus, [0, 1])
 
     @patch('vllm_ascend.cpu_binding.execute_command')
     def test_parse_topo_affinity(self, mock_execute_command):
@@ -68,6 +75,15 @@ class TestDeviceInfo(unittest.TestCase):
     def test_expand_cpu_list(self):
         result = self.device_info.expand_cpu_list("0-2, 4, 6-8")
         self.assertEqual(result, [0, 1, 2, 4, 6, 7, 8])
+
+    @patch('vllm_ascend.cpu_binding.ASCEND_RT_VISIBLE_DEVICES', '3')
+    def test_get_current_npu_id_single_visible(self):
+        self.assertEqual(get_current_npu_id(0), 3)
+
+    @patch('vllm_ascend.cpu_binding.ASCEND_RT_VISIBLE_DEVICES', '2,3,4,5')
+    def test_get_current_npu_id_visible_list(self):
+        self.assertEqual(get_current_npu_id(0), 2)
+        self.assertEqual(get_current_npu_id(2), 4)
 
 
 class TestCpuAlloc(unittest.TestCase):
@@ -115,6 +131,14 @@ class TestCpuAlloc(unittest.TestCase):
         result = self.cpu_alloc.extend_numa([0, 1])
         self.assertEqual(result, [0, 1, 3])
 
+    def test_get_nearest_numa_node(self):
+        self.cpu_alloc.numa_to_cpu_map = {0: [0, 1], 1: [2, 3], 2: [4, 5]}
+        self.cpu_alloc.numa_distance = {0: [10, 20, 15], 1: [20, 10, 30], 2: [15, 30, 10]}
+        self.assertEqual(self.cpu_alloc.get_nearest_numa_node(0), 2)
+        self.assertEqual(self.cpu_alloc.get_nearest_numa_node(1), 0)
+        self.cpu_alloc.numa_distance = {}
+        self.assertEqual(self.cpu_alloc.get_nearest_numa_node(2), 0)
+
     @patch('vllm_ascend.cpu_binding.execute_command')
     def test_build_cpu_node_map(self, mock_execute_command):
         mock_execute_command.return_value = ("", 0)
@@ -128,16 +152,54 @@ class TestCpuAlloc(unittest.TestCase):
         self.assertEqual(self.cpu_alloc.numa_to_cpu_map,
                          expected_numa_to_cpu_map)
 
+    @patch('vllm_ascend.cpu_binding.get_ascend_device_type')
     @patch('vllm_ascend.cpu_binding.execute_command')
-    def test_handle_no_affinity(self, mock_execute_command):
-        mock_execute_command.side_effect = [("0 0\n1 1", 0), ("0 0\n1 1", 0)]
+    def test_build_cpu_pools_numa_uniform_fallback(self, mock_execute_command, mock_get_device_type):
+        mock_get_device_type.return_value = AscendDeviceType.A2
+        mock_execute_command.side_effect = [("0 0\n1 1\n2 0\n3 1", 0), ("0 0\n1 1\n2 0\n3 1", 0)]
         self.cpu_alloc.device_info.running_npu_list = [0, 1]
         self.cpu_alloc.device_info.allowed_cpus = [0, 1, 2, 3]
-        self.cpu_alloc.device_info.affinity = {}
+        self.cpu_alloc.device_info.npu_affinity = {}
         self.assertEqual(self.cpu_alloc.npu_cpu_pool, {})
-        self.cpu_alloc.device_info.affinity = {0: [0, 1], 1: [2, 3]}
+        self.cpu_alloc.device_info.npu_affinity = {0: [0, 1], 1: [2, 3]}
         self.cpu_alloc.build_cpu_pools()
         self.assertEqual(len(self.cpu_alloc.npu_cpu_pool), 2)
+
+    @patch('vllm_ascend.cpu_binding.get_ascend_device_type')
+    @patch('vllm_ascend.cpu_binding.execute_command')
+    def test_build_cpu_pools_numa_affinity_a2(self, mock_execute_command, mock_get_device_type):
+        mock_get_device_type.return_value = AscendDeviceType.A2
+        mock_execute_command.side_effect = [("0 0\n1 1\n2 0\n3 1", 0), ("0 0\n1 1\n2 0\n3 1", 0)]
+        self.cpu_alloc.device_info.running_npu_list = [0, 1]
+        self.cpu_alloc.device_info.allowed_cpus = [0, 1, 2, 3]
+        self.cpu_alloc.device_info.npu_affinity = {0: [0, 2], 1: [1, 3]}
+        self.cpu_alloc.build_cpu_pools()
+        self.assertEqual(self.cpu_alloc.npu_cpu_pool[0], [0, 1])
+        self.assertEqual(self.cpu_alloc.npu_cpu_pool[1], [2, 3])
+
+    @patch('vllm_ascend.cpu_binding.get_ascend_device_type')
+    @patch('vllm_ascend.cpu_binding.execute_command')
+    def test_build_cpu_pools_uniform_a3(self, mock_execute_command, mock_get_device_type):
+        mock_get_device_type.return_value = AscendDeviceType.A3
+        mock_execute_command.return_value = ("0 0\n1 0\n2 1\n3 1\n4 0\n5 1", 0)
+        self.cpu_alloc.device_info.running_npu_list = [0, 1]
+        self.cpu_alloc.device_info.allowed_cpus = [0, 1, 2, 3, 4, 5]
+        self.cpu_alloc.device_info.npu_affinity = {0: [0, 1], 1: [2, 3]}
+        self.cpu_alloc.build_cpu_pools()
+        self.assertEqual(self.cpu_alloc.npu_cpu_pool[0], [0, 1, 4])
+        self.assertEqual(self.cpu_alloc.npu_cpu_pool[1], [2, 3, 5])
+
+    def test_get_nearest_numa_node_fallback_order(self):
+        self.cpu_alloc.numa_to_cpu_map = {0: [0, 1], 1: [2, 3], 2: [4, 5]}
+        self.cpu_alloc.numa_distance = {}
+        self.assertEqual(self.cpu_alloc.get_nearest_numa_node(1), 2)
+
+    def test_build_cpu_pools_numa_uniform_no_allowed_cpus(self):
+        self.cpu_alloc.numa_to_cpu_map = {0: [0, 1], 1: [2, 3]}
+        self.cpu_alloc.device_info.allowed_cpus = []
+        self.cpu_alloc.device_info.running_npu_list = [0, 1]
+        self.cpu_alloc.build_cpu_pools_numa_uniform()
+        self.assertEqual(self.cpu_alloc.npu_cpu_pool, {})
 
     @patch('vllm_ascend.cpu_binding.execute_command')
     def test_allocate(self, mock_execute_command):

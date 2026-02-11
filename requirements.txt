@@ -8,6 +8,7 @@ pip
 pybind11
 pyyaml
 scipy
+psutil
 pandas
 setuptools>=64
 setuptools-scm>=8

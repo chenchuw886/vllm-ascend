@@ -39,7 +39,7 @@ The following table lists additional configuration options available in vLLM Asc
 | `multistream_overlap_shared_expert` | bool | `False` | Whether to enable multistream shared expert. This option only takes effect on MoE models with shared experts. |
 | `multistream_overlap_gate`          | bool | `False` | Whether to enable multistream overlap gate. This option only takes effect on MoE models with shared experts.  |
 | `recompute_scheduler_enable`        | bool | `False` | Whether to enable recompute scheduler.                                                                    |
-| `enable_cpu_binding`                | bool | `False` | Whether to enable CPU binding.                                                                            |
+| `enable_cpu_binding`                | bool | `True`  | Whether to enable CPU binding.                                                                            |
 | `SLO_limits_for_dynamic_batch`      | int  | `-1`    | SLO limits for dynamic batch. This is new scheduler to support dynamic feature                            |
 | `enable_npugraph_ex`                | bool | `False` | Whether to enable npugraph ex graph mode.                                                                 |
 | `pa_shape_list`                     | list | `[]`    | The custom shape list of page attention ops.                                                              |
@@ -47,6 +47,18 @@ The following table lists additional configuration options available in vLLM Asc
 | `layer_sharding` | dict | `{}` | Configuration options for layer sharding linear |
 
 The details of each configuration option are as follows:
+
+**CPU Binding**
+
+CPU binding can be controlled by `enable_cpu_binding` in `additional_config`.
+When enabled, it is applied automatically on ARM platforms and disabled on x86 platforms.
+A3 uses NUMA-aware uniform binding and other devices use NUMA affinity binding.
+
+Binding flow (high level):
+1. Detect running NPUs via `npu-smi`, and read `Cpus_allowed_list` from `/proc/self/status`.
+2. Build CPU→NUMA mapping from `lscpu -e=CPU,NODE`, and read NUMA distances from `/sys/devices/system/node/nodeX/distance`.
+3. Choose strategy: A3 uses NUMA-aware uniform distribution; other devices use NUMA affinity binding, and fall back to NUMA-aware uniform if affinity is missing.
+4. Split each NPU CPU pool into `main`, `acl_thread`, and `release_thread` CPUs and bind via `taskset`.
 
 **xlite_graph_config**
 
