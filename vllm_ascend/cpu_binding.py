@@ -119,12 +119,80 @@ class CpuAlloc:
     def __init__(self, rank_id: int):
         self.rank_id = rank_id
         self.device_info: DeviceInfo = DeviceInfo()
+        self._shard_allowed_cpus_by_rank_scope()
         self.cpu_node: dict[int, int] = {}
         self.numa_to_cpu_map: dict[int, list[int]] = defaultdict(list)
         self.npu_cpu_pool: dict[int, list[int]] = {}
         self.assign_main: dict[int, list[int]] = {}
         self.assign_acl: dict[int, list[int]] = {}
         self.assign_rel: dict[int, list[int]] = {}
+
+    def _get_cpu_shard_scope(self) -> tuple[str, int | None, int]:
+        try:
+            from vllm.config import get_current_vllm_config
+            from vllm.distributed.parallel_state import get_world_group, in_the_same_node_as
+            import torch.distributed as dist
+        except Exception as exc:
+            logger.warning(f"World group not available for CPU sharding: {exc}")
+            return "none", None, 1
+        vllm_config = get_current_vllm_config()
+        if vllm_config is None:
+            logger.warning("Current vLLM config is not available for CPU sharding.")
+            return "none", None, 1
+        parallel_config = vllm_config.parallel_config
+        try:
+            if dist.is_available() and dist.is_initialized() and dist.get_world_size() > 1:
+                world_group = get_world_group()
+                same_node_flags = in_the_same_node_as(world_group.cpu_group, world_group.rank)
+                local_ranks = [idx for idx, same_node in enumerate(same_node_flags) if same_node]
+                local_ranks.sort()
+                local_rank = local_ranks.index(world_group.rank)
+                logger.info(
+                    "CPU shard scope detection: world_rank=%s world_size=%s "
+                    "node_local_rank=%s node_local_world_size=%s same_node_flags=%s",
+                    world_group.rank,
+                    dist.get_world_size(),
+                    local_rank,
+                    len(local_ranks),
+                    same_node_flags,
+                )
+                return "node", local_rank, len(local_ranks)
+        except Exception as exc:
+            logger.warning(f"Node-local rank detection failed, fallback to global rank: {exc}")
+        world_size = getattr(parallel_config, "world_size_across_dp",
+                             getattr(parallel_config, "world_size", 1))
+        global_rank = getattr(parallel_config, "rank", None)
+        return "global", global_rank, world_size
+
+    @staticmethod
+    def _slice_cpus_for_shard(cpus: list[int], shard_rank: int, shard_size: int) -> list[int]:
+        total = len(cpus)
+        base = total // shard_size
+        extra = total % shard_size
+        start = shard_rank * base + min(shard_rank, extra)
+        end = start + base + (1 if shard_rank < extra else 0)
+        return cpus[start:end]
+
+    def _shard_allowed_cpus_by_rank_scope(self) -> None:
+        shard_scope, shard_rank, shard_size = self._get_cpu_shard_scope()
+        if shard_rank is None or shard_size <= 1:
+            return
+        allowed_cpus = self.device_info.allowed_cpus
+        if not allowed_cpus:
+            return
+        shard = self._slice_cpus_for_shard(allowed_cpus, shard_rank, shard_size)
+        if not shard:
+            logger.warning(
+                f"CPU shard is empty for {shard_scope}_rank={shard_rank}, {shard_scope}_world_size={shard_size}. "
+                "Keep full allowed CPU list."
+            )
+            return
+        self.device_info.allowed_cpus = shard
+        logger.info(
+            f"Shard allowed CPUs by {shard_scope} rank: {shard_scope}_rank={shard_rank}, "
+            f"{shard_scope}_world_size={shard_size}, "
+            f"cpus={shard[0]}-{shard[-1]} (count={len(shard)})."
+        )
 
     @staticmethod
     def get_threads_map(thread_message: str) -> dict[str, dict[str, list[str]]]:

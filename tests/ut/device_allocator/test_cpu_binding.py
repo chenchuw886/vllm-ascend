@@ -1,4 +1,5 @@
 import unittest
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from vllm_ascend.cpu_binding import CpuAlloc, DeviceInfo, bind_cpus, is_arm_cpu
@@ -120,6 +121,40 @@ class TestCpuAlloc(unittest.TestCase):
             self.cpu_alloc.build_cpu_pools()
         mock_build_cpu_node_map.assert_called_once()
         mock_handle_no_affinity.assert_called_once()
+
+    @patch('vllm.distributed.parallel_state.in_the_same_node_as')
+    @patch('vllm.distributed.parallel_state.get_world_group')
+    @patch('torch.distributed.is_initialized')
+    @patch('vllm.config.get_current_vllm_config')
+    def test_shard_allowed_cpus_by_node_rank(self, mock_get_current_config, mock_is_initialized,
+                                             mock_get_world_group, mock_in_the_same_node_as):
+        mock_get_current_config.return_value = SimpleNamespace(
+            parallel_config=SimpleNamespace(world_size=2, world_size_across_dp=2, rank=1)
+        )
+        mock_is_initialized.return_value = True
+        with patch('torch.distributed.get_world_size', return_value=2):
+            mock_get_world_group.return_value = SimpleNamespace(rank=1, cpu_group=object())
+            mock_in_the_same_node_as.return_value = [True, True]
+            self.cpu_alloc.device_info.allowed_cpus = list(range(8))
+            self.cpu_alloc._shard_allowed_cpus_by_rank_scope()
+            self.assertEqual(self.cpu_alloc.device_info.allowed_cpus, [4, 5, 6, 7])
+
+    @patch('vllm.distributed.parallel_state.in_the_same_node_as')
+    @patch('vllm.distributed.parallel_state.get_world_group')
+    @patch('torch.distributed.is_initialized')
+    @patch('vllm.config.get_current_vllm_config')
+    def test_shard_allowed_cpus_by_global_rank_fallback(self, mock_get_current_config, mock_is_initialized,
+                                                        mock_get_world_group, mock_in_the_same_node_as):
+        mock_get_current_config.return_value = SimpleNamespace(
+            parallel_config=SimpleNamespace(world_size=2, world_size_across_dp=4, rank=2)
+        )
+        mock_is_initialized.return_value = True
+        with patch('torch.distributed.get_world_size', return_value=1):
+            mock_get_world_group.return_value = SimpleNamespace(rank=2, cpu_group=object())
+            mock_in_the_same_node_as.side_effect = RuntimeError("fail")
+            self.cpu_alloc.device_info.allowed_cpus = list(range(8))
+            self.cpu_alloc._shard_allowed_cpus_by_rank_scope()
+            self.assertEqual(self.cpu_alloc.device_info.allowed_cpus, [4, 5])
 
     def test_extend_numa(self):
         result = self.cpu_alloc.extend_numa([])
