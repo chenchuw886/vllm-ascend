@@ -210,37 +210,29 @@ class CpuAlloc:
 
     def handle_no_affinity(self) -> None:
         num_running_npu = len(self.device_info.running_npu_list)
-        num_numa_node = len(self.numa_to_cpu_map)
-        if num_numa_node == 0 or num_running_npu == 0:
+        if num_running_npu == 0 or not self.numa_to_cpu_map:
             return
-        if num_running_npu % num_numa_node != 0:
-            npu_num_per_node = num_running_npu // num_numa_node + 1
-        else:
-            npu_num_per_node = num_running_npu // num_numa_node
-        index = 0
+        available_nodes: list[tuple[int, list[int]]] = []
         for node in sorted(self.numa_to_cpu_map):
-            # Available CPUs on this NUMA (constrained by allowed_cpus)
+            # Only keep CPUs allowed by current process affinity mask.
             cpus = [c for c in self.numa_to_cpu_map[node] if c in self.device_info.allowed_cpus]
-            if not cpus:
-                continue
-            # The actual number of NPUs to be allocated on this NUMA.
-            npu_num_this_node = min(npu_num_per_node, num_running_npu - index)
-            if npu_num_this_node <= 0:
-                break
-            # NUMA-balanced distribute the CPUs of this NUMA node among npu_num_this_node NPUs.
-            total_cpu_num = len(cpus)
-            base_cpu_num = total_cpu_num // npu_num_this_node
-            extra_cpu_num = total_cpu_num % npu_num_this_node
-            start_index = 0
-            for i in range(npu_num_this_node):
-                take_cpu_num = base_cpu_num + (1 if i < extra_cpu_num else 0)
-                end_index = start_index + take_cpu_num
-                select_cpus_list = cpus[start_index:end_index]
-                if index < num_running_npu:
-                    npu = self.device_info.running_npu_list[index]
-                    self.npu_cpu_pool[npu] = select_cpus_list
-                    index += 1
-                start_index = end_index
+            if cpus:
+                available_nodes.append((node, cpus))
+        if not available_nodes:
+            return
+        if num_running_npu == 1:
+            # Single visible NPU: use rank_id to round-robin pick a NUMA group
+            # so that multiple processes don't all fall onto NUMA0.
+            node_index = self.rank_id % len(available_nodes)
+            _, cpus = available_nodes[node_index]
+            npu = self.device_info.running_npu_list[0]
+            self.npu_cpu_pool[npu] = cpus
+            return
+        # Multiple visible NPUs: assign in order, one NPU per NUMA group,
+        # cycling through groups when NPU count exceeds NUMA count.
+        for idx, npu in enumerate(self.device_info.running_npu_list):
+            _, cpus = available_nodes[idx % len(available_nodes)]
+            self.npu_cpu_pool[npu] = cpus
 
     DEVICE_BINDING_MODE = {
         AscendDeviceType.A3: "numa_balanced",
