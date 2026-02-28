@@ -221,15 +221,16 @@ class CpuAlloc:
         if not available_nodes:
             return
         if num_running_npu == 1:
-            # Single visible NPU: use rank_id to round-robin pick a NUMA group
-            # so that multiple processes don't all fall onto NUMA0.
-            node_index = self.rank_id % len(available_nodes)
-            _, cpus = available_nodes[node_index]
             npu = self.device_info.running_npu_list[0]
+            # Single visible NPU: round-robin pick a NUMA group by NPU id
+            # so multiple processes don't all fall onto NUMA0 even if rank_id
+            # is always 0.
+            node_index = npu % len(available_nodes)
+            _, cpus = available_nodes[node_index]
             self.npu_cpu_pool[npu] = cpus
             return
-        # Multiple visible NPUs: assign in order, one NPU per NUMA group,
-        # cycling through groups when NPU count exceeds NUMA count.
+        # Multiple visible NPUs: round-robin assign in order, one NPU per NUMA
+        # group, cycling through groups when NPU count exceeds NUMA count.
         for idx, npu in enumerate(self.device_info.running_npu_list):
             _, cpus = available_nodes[idx % len(available_nodes)]
             self.npu_cpu_pool[npu] = cpus
