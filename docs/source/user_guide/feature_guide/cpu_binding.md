@@ -65,9 +65,9 @@ If `/proc/irq` is not writable, IRQ binding is skipped.
 
 ## Usage
 
-> **Note**: CPU binding is **only enabled on ARM hosts**. On x86 hosts, it is automatically skipped.
+> **Note**: CPU binding is **enabled by default**, and **only enabled on ARM hosts**. On x86 hosts, it is automatically skipped.
 
-CPU binding is enabled by default. To run with explicit configuration:
+To run with explicit configuration:
 
 ### Online Inference
 
@@ -111,16 +111,6 @@ llm = LLM(
 prompts = ["Hello, how are you?"]
 sampling_params = SamplingParams(temperature=0.8, top_p=0.95)
 outputs = llm.generate(prompts, sampling_params)
-```
-
-### Configuration
-
-CPU binding is controlled by `additional_config.enable_cpu_binding` (default: `True`):
-
-```python
-additional_config = {
-    "enable_cpu_binding": True,  # Enable CPU binding (default)
-}
 ```
 
 ## Requirements
