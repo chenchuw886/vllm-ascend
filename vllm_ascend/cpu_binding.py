@@ -315,15 +315,34 @@ class CpuAlloc:
         logger.info(f"NPU{current_npu}: main=[{main}]  acl=[{acl}]  release=[{rel}]")
 
     def bind_memory(self, pid: str, npu: int) -> None:
+        def _get_npu_numa_node(npu_id: int) -> int | None:
+            cpu_pool = self.npu_cpu_pool.get(npu_id, [])
+            if not cpu_pool:
+                return None
+            anchor_cpu = cpu_pool[0]
+            return self.cpu_node.get(anchor_cpu)
+
         if not shutil.which("migratepages"):
             logger.info("The 'migratepages' command is not available, skipping memory binding.")
             return
+        target_numa = _get_npu_numa_node(npu)
+        if target_numa is None:
+            logger.warning(f"[migrate] rank:{self.rank_id} -> NPU{npu} has no CPU pool, skip memory binding.")
+            return
         all_numa_nodes = sorted(self.numa_to_cpu_map.keys())
-        target_cpu = self.assign_acl[npu][0]
-        target_numa = self.cpu_node[target_cpu]
-        bind_numa_list = [target_numa, target_numa + 1 if target_numa % 2 == 0 else target_numa - 1]
-        logger.info(f"[migrate] rank:{self.rank_id} -> NUMA {bind_numa_list}")
-        execute_command(["migratepages", pid, ",".join(map(str, all_numa_nodes)), ",".join(map(str, bind_numa_list))])
+        if target_numa not in all_numa_nodes:
+            logger.warning(
+                f"[migrate] rank:{self.rank_id} -> NUMA {target_numa} not found, skip memory binding."
+            )
+            return
+        # Bind memory to the NPU's NUMA node only to minimize cross-NUMA traffic.
+        logger.info(f"[migrate] rank:{self.rank_id} -> NUMA [{target_numa}]")
+        execute_command([
+            "migratepages",
+            pid,
+            ",".join(map(str, all_numa_nodes)),
+            str(target_numa),
+        ])
 
     def bind_threads(self) -> None:
         thread_message, _ = execute_command(["ps", "-Te"])
