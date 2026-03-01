@@ -209,51 +209,76 @@ class CpuAlloc:
             raise RuntimeError("lscpu command output error, no NUMA node available. Please check!")
 
     def handle_no_affinity(self) -> None:
-        def _slice_cpu_pool(cpu_pool: list[int], slices: int) -> list[list[int]]:
-            if slices <= 0:
-                return []
-            if not cpu_pool:
-                return [[] for _ in range(slices)]
-            total = len(cpu_pool)
-            base = total // slices
-            extra = total % slices
-            result: list[list[int]] = []
-            start = 0
-            for i in range(slices):
-                take = base + (1 if i < extra else 0)
-                end = start + take
-                result.append(cpu_pool[start:end])
-                start = end
-            return result
-
-        num_running_npu = len(self.device_info.running_npu_list)
-        if num_running_npu == 0 or not self.numa_to_cpu_map:
+        """
+        New-logic based:
+        1) Build available NUMA nodes after allowed_cpus filtering
+        2) Assign NPUs to NUMA nodes by round-robin (npu_id % num_nodes)
+        3) Within each NUMA node, split its CPU list into per-NPU disjoint slices
+        """
+        running = list(self.device_info.running_npu_list)
+        if not running or not self.numa_to_cpu_map:
             return
+
+        # 1) Only keep NUMA nodes that still have CPUs after allowed_cpus filtering.
         available_nodes: list[tuple[int, list[int]]] = []
         for node in sorted(self.numa_to_cpu_map):
-            # Only keep CPUs allowed by current process affinity mask.
             cpus = [c for c in self.numa_to_cpu_map[node] if c in self.device_info.allowed_cpus]
             if cpus:
                 available_nodes.append((node, cpus))
         if not available_nodes:
             return
+
         num_nodes = len(available_nodes)
-        npu_index = 0
-        for _, cpu_pool in available_nodes:
-            remaining = num_running_npu - npu_index
-            if remaining <= 0:
-                break
-            # Spread NPU processes evenly across NUMA nodes to avoid
-            # over-concentrating on a single node when affinity info is absent.
-            npu_count_for_node = (remaining + num_nodes - 1) // num_nodes
-            cpu_slices = _slice_cpu_pool(cpu_pool, npu_count_for_node)
-            for slice_index in range(npu_count_for_node):
-                if npu_index >= num_running_npu:
-                    break
-                npu = self.device_info.running_npu_list[npu_index]
-                self.npu_cpu_pool[npu] = cpu_slices[slice_index]
-                npu_index += 1
-            num_nodes -= 1
+
+        # Infer "my_npu" from local rank + visible running_npu_list, assuming local rank is index into running_npu_list.
+        if 0 <= self.rank_id < len(running):
+            my_npu = running[self.rank_id]
+        else:
+            # Fallback: modulo in case rank range is larger than visible list length.
+            my_npu = running[self.rank_id % len(running)]
+
+        print(
+            f"[no_affinity_fine] rank:{self.rank_id} -> my_npu:{my_npu}; "
+            f"running_npu_list:{running}; num_available_nodes:{num_nodes}"
+        )
+
+        # 2) Round-robin assign NPUs to nodes based on NPU id (same as new logic).
+        # Build: node_index -> list[npu]
+        node_to_npus: dict[int, list[int]] = {i: [] for i in range(num_nodes)}
+        for npu in running:
+            node_index = npu % num_nodes
+            node_to_npus[node_index].append(npu)
+
+        # 3) Within each node, split cpus among the NPUs assigned to this node.
+        for node_index, npus in node_to_npus.items():
+            if not npus:
+                continue
+
+            node_id, cpus = available_nodes[node_index]
+            total_cpu_num = len(cpus)
+            n = len(npus)
+
+            # Edge case: should not happen because we filtered cpus, but keep safe.
+            if total_cpu_num == 0:
+                continue
+
+            # If CPUs are fewer than NPUs, we can only guarantee small (possibly duplicated) slices.
+            if total_cpu_num < n:
+                for i, npu in enumerate(npus):
+                    cpu = cpus[i % total_cpu_num]
+                    self.npu_cpu_pool[npu] = [cpu]
+                continue
+
+            # Even split (disjoint slices), first 'extra' NPUs take 1 more CPU.
+            base = total_cpu_num // n
+            extra = total_cpu_num % n
+
+            start = 0
+            for i, npu in enumerate(npus):
+                take = base + (1 if i < extra else 0)
+                end = start + take
+                self.npu_cpu_pool[npu] = cpus[start:end]
+                start = end
 
     DEVICE_BINDING_MODE = {
         AscendDeviceType.A3: "numa_balanced",
@@ -332,11 +357,11 @@ class CpuAlloc:
         all_numa_nodes = sorted(self.numa_to_cpu_map.keys())
         if target_numa not in all_numa_nodes:
             logger.warning(
-                f"[migrate] rank:{self.rank_id} -> NUMA {target_numa} not found, skip memory binding."
+                f"[migrate] NPU:{npu} -> NUMA {target_numa} not found, skip memory binding."
             )
             return
         # Bind memory to the NPU's NUMA node only to minimize cross-NUMA traffic.
-        logger.info(f"[migrate] rank:{self.rank_id} -> NUMA [{target_numa}]")
+        logger.info(f"[migrate] NPU:{npu} -> NUMA [{target_numa}]")
         execute_command([
             "migratepages",
             pid,
