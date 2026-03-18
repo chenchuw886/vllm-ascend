@@ -438,11 +438,17 @@ class CpuAlloc:
         main_pid = str(psutil.Process().pid)
         current_npu = self.device_info.running_npu_list[self.rank_id]
         self.bind(main_pid, self.assign_main[current_npu], True)
-        for acl_thread in threads_map.get(main_pid, {}).get("acl_thread", []):
-            self.bind(acl_thread, self.assign_acl[current_npu], False)
-            self.bind_memory(acl_thread, current_npu)
-        for release_thread in threads_map.get(main_pid, {}).get("release_thread", []):
-            self.bind(release_thread, self.assign_rel[current_npu], False)
+        acl_cpus = self.assign_acl[current_npu]
+        rel_cpus = self.assign_rel[current_npu]
+        for idx, acl_thread in enumerate(threads_map.get(main_pid, {}).get("acl_thread", [])):
+            if acl_cpus:
+                cpu = acl_cpus[idx % len(acl_cpus)]
+                self.bind(acl_thread, [cpu], False)
+                self.bind_memory(acl_thread, current_npu)
+        for idx, release_thread in enumerate(threads_map.get(main_pid, {}).get("release_thread", [])):
+            if rel_cpus:
+                cpu = rel_cpus[idx % len(rel_cpus)]
+                self.bind(release_thread, [cpu], False)
 
     def bind_npu_irq(self) -> None:
         if not os.access("/proc/irq", os.W_OK):
