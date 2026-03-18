@@ -117,6 +117,10 @@ env_variables: dict[str, Callable[[], Any]] = {
     "VLLM_ASCEND_FUSION_OP_TRANSPOSE_KV_CACHE_BY_BLOCK": lambda: bool(
         int(os.getenv("VLLM_ASCEND_FUSION_OP_TRANSPOSE_KV_CACHE_BY_BLOCK", "1"))
     ),
+    # Number of CPU cores pinned to each acl_thread. Valid range: >=1. Default: 2.
+    "VLLM_ASCEND_ACL_THREAD_CPU_NUM": lambda: int(os.getenv("VLLM_ASCEND_ACL_THREAD_CPU_NUM", "2")),
+    # Number of CPU cores pinned to each release_thread. Valid range: >=1. Default: 2.
+    "VLLM_ASCEND_RELEASE_THREAD_CPU_NUM": lambda: int(os.getenv("VLLM_ASCEND_RELEASE_THREAD_CPU_NUM", "2")),
 }
 
 # end-env-vars-definition

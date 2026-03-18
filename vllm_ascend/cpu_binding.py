@@ -9,10 +9,12 @@ from collections import defaultdict
 import psutil
 from vllm.logger import logger
 
+import vllm_ascend.envs as envs_ascend
 from vllm_ascend.utils import AscendDeviceType, get_ascend_device_type
 
 MASK_BIT = 32  # Number of bits in a CPU affinity mask group
-MIN_CPUS_PER_NPU = 5  # 2(IRQ) + 1(main, at least 1 CPU) + 1(acl) + 1(release) = 5 CPUs per NPU
+IRQ_RESERVED_CPUS = 2  # sq/cq IRQ binding
+MIN_MAIN_CPUS = 1  # main thread requires at least 1 CPU
 ALLOWED_CPUS_PATH = "/proc/self/status"
 ASCEND_RT_VISIBLE_DEVICES = os.getenv("ASCEND_RT_VISIBLE_DEVICES")
 
@@ -24,6 +26,24 @@ DEVICE_BINDING_MODE: dict["AscendDeviceType", str] = {
     AscendDeviceType.A3: GLOBAL_SLICE_MODE,
     AscendDeviceType._310P: TOPO_AFFINITY_MODE,
 }
+
+
+def _get_acl_thread_cpu_num() -> int:
+    acl_num = int(envs_ascend.VLLM_ASCEND_ACL_THREAD_CPU_NUM)
+    if acl_num < 1:
+        raise RuntimeError(f"Invalid VLLM_ASCEND_ACL_THREAD_CPU_NUM: {acl_num}. Must be >= 1.")
+    return acl_num
+
+
+def _get_release_thread_cpu_num() -> int:
+    rel_num = int(envs_ascend.VLLM_ASCEND_RELEASE_THREAD_CPU_NUM)
+    if rel_num < 1:
+        raise RuntimeError(f"Invalid VLLM_ASCEND_RELEASE_THREAD_CPU_NUM: {rel_num}. Must be >= 1.")
+    return rel_num
+
+
+def _get_min_cpus_per_npu() -> int:
+    return IRQ_RESERVED_CPUS + MIN_MAIN_CPUS + _get_acl_thread_cpu_num() + _get_release_thread_cpu_num()
 
 
 def is_arm_cpu() -> bool:
@@ -278,15 +298,16 @@ class CpuAlloc:
             f"base:{base} extra:{extra} allowed_cpus_head:{allowed[:16]} allowed_cpus_tail:{allowed[-16:]}"
         )
 
-        # Enforce per-NPU slice length >= 5.
+        # Enforce per-NPU slice length >= min requirement.
         # Because with remainder distribution, some NPUs may get 'base' cores and some get 'base+1'.
         # The minimum slice size is 'base'.
-        if base < MIN_CPUS_PER_NPU:
+        min_cpus_per_npu = _get_min_cpus_per_npu()
+        if base < min_cpus_per_npu:
             raise RuntimeError(
                 "Insufficient CPUs for binding with IRQ/ACL/REL reservations: "
                 f"total_allowed={total_cpu}, total_npus={total_npus}, "
-                f"min_per_npu={base} (<{MIN_CPUS_PER_NPU}). "
-                f"Need at least {total_npus * MIN_CPUS_PER_NPU} CPUs in cpuset."
+                f"min_per_npu={base} (<{min_cpus_per_npu}). "
+                f"Need at least {total_npus * min_cpus_per_npu} CPUs in cpuset."
             )
 
         def _slice_for_npu(global_npu_id: int) -> list[int]:
@@ -300,10 +321,10 @@ class CpuAlloc:
             if npu < 0 or npu >= total_npus:
                 raise RuntimeError(f"Invalid NPU id {npu}, total_npus={total_npus}.")
             cpus = _slice_for_npu(npu)
-            # Extra safety: should always be >= base >= 5
-            if len(cpus) < MIN_CPUS_PER_NPU:
+            # Extra safety: should always be >= base >= min requirement
+            if len(cpus) < min_cpus_per_npu:
                 raise RuntimeError(
-                    f"NPU{npu} got too few CPUs: {len(cpus)} (<5). "
+                    f"NPU{npu} got too few CPUs: {len(cpus)} (<{min_cpus_per_npu}). "
                     f"total_allowed={total_cpu}, total_npus={total_npus}, base={base}, extra={extra}"
                 )
             self.npu_cpu_pool[npu] = cpus
@@ -351,13 +372,23 @@ class CpuAlloc:
 
     def allocate(self) -> None:
         for npu, pool in self.npu_cpu_pool.items():
-            if len(pool) >= MIN_CPUS_PER_NPU:
-                main = pool[2:-2]
-                acl = [pool[-2]]
-                rel = [pool[-1]]
+            acl_num = _get_acl_thread_cpu_num()
+            rel_num = _get_release_thread_cpu_num()
+            min_cpus_per_npu = _get_min_cpus_per_npu()
+            if len(pool) >= min_cpus_per_npu:
+                main_start = IRQ_RESERVED_CPUS
+                main_end = len(pool) - (acl_num + rel_num)
+                if main_end - main_start < MIN_MAIN_CPUS:
+                    raise RuntimeError(
+                        "The number of CPUs is insufficient. "
+                        f"Each NPU requires at least {min_cpus_per_npu} CPUs."
+                    )
+                main = pool[main_start:main_end]
+                acl = pool[main_end : main_end + acl_num]
+                rel = pool[main_end + acl_num :]
             else:
                 raise RuntimeError(
-                    f"The number of CPUs is insufficient. Each NPU requires at least {MIN_CPUS_PER_NPU} CPUs."
+                    f"The number of CPUs is insufficient. Each NPU requires at least {min_cpus_per_npu} CPUs."
                 )
             self.assign_main[npu] = main
             self.assign_acl[npu] = acl

@@ -91,7 +91,7 @@ For best results, if you run inside a docker container, which `systemctl` is lik
 |Error/Warning Message|Core Cause|Solution|
 |---|---|---|
 |Can not get running npu info.|The npu-smi process table is empty, or the `ASCEND_RT_VISIBLE_DEVICES` environment variable filters out all NPUs.|1. Ensure the process is running on visible NPUs; 2. Verify that the `ASCEND_RT_VISIBLE_DEVICES` value matches the actual logical NPU IDs.|
-|Insufficient CPUs for binding...|The number of CPU cores allocated to each NPU is less than the minimum requirement of 5.|1. Expand the allowed CPU list; 2. Reduce the number of visible NPUs.|
+|Insufficient CPUs for binding...|The number of CPU cores allocated to each NPU is less than the minimum requirement (IRQ 2 + main >=1 + acl + release). Defaults to 7 (2+1+2+2).|1. Expand the allowed CPU list; 2. Reduce the number of visible NPUs; 3. Adjust `VLLM_ASCEND_ACL_THREAD_CPU_NUM` / `VLLM_ASCEND_RELEASE_THREAD_CPU_NUM`.|
 |NPU topo affinity not found...|npu-smi is unable to retrieve NPU topology affinity information.|Verify the integrity of the npu-smi installation and ensure the user has sufficient execution permissions.|
 |Bind cpus failed in rankX...|The CPU binding process failed (e.g., taskset is unavailable, or the user lacks write permissions for /proc/irq).|1. Confirm that required tools (taskset, lscpu, npu-smi) are installed and available; 2. Verify the Cpus_allowed_list in `/proc/self/status` is valid.|
 
@@ -129,4 +129,11 @@ No. It only affects host‑side affinity and should not change numerical results
 
 2. **Usage**: Enable or disable with `enable_cpu_binding` via `additional_config` in both online and offline workflows.
 
-3. **Key Limitations**: ARM‑only; relies on symmetric NUMA layouts; binding fails if the CPU pool has fewer than 5 cores; binding errors trigger a warning log but do not terminate the process.
+3. **Key Limitations**: ARM‑only; relies on symmetric NUMA layouts; binding fails if the CPU pool has fewer than the minimum required cores (IRQ 2 + main >=1 + acl + release, default 7); binding errors trigger a warning log but do not terminate the process.
+
+## Advanced Configuration
+
+You can adjust how many CPU cores are pinned to the ACL and release threads:
+
+- `VLLM_ASCEND_ACL_THREAD_CPU_NUM` (default: 2, valid >=1)
+- `VLLM_ASCEND_RELEASE_THREAD_CPU_NUM` (default: 2, valid >=1)
