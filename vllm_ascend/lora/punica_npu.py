@@ -49,6 +49,9 @@ class PunicaWrapperNPU(PunicaWrapperBase):
         self.sgmv_expand_slice = sgmv_expand_slice
         self.sgmv_shrink = sgmv_shrink
 
+    def _get_token_lora_indices(self, x: torch.Tensor) -> torch.Tensor:
+        return torch.narrow(self._token_lora_indices, 0, 0, x.size(0))
+
     def _shrink_prefill(
         self,
         y: torch.Tensor,
@@ -74,7 +77,7 @@ class PunicaWrapperNPU(PunicaWrapperBase):
         w_t_all: torch.Tensor,
         scale: float,
     ):
-        self.bgmv_shrink(x, w_t_all, y, self.token_lora_indices, scale)
+        self.bgmv_shrink(x, w_t_all, y, self._get_token_lora_indices(x), scale)
 
     def _expand_prefill(
         self,
@@ -101,7 +104,7 @@ class PunicaWrapperNPU(PunicaWrapperBase):
         w_t_all: torch.Tensor,
         add_inputs: bool,
     ):
-        self.bgmv_expand(x, w_t_all, y, self.token_lora_indices, add_inputs)
+        self.bgmv_expand(x, w_t_all, y, self._get_token_lora_indices(x), add_inputs)
 
     def _expand_slice_prefill(
         self,
@@ -134,7 +137,15 @@ class PunicaWrapperNPU(PunicaWrapperBase):
         y_slice_size: int,
         add_inputs: bool,
     ):
-        self.bgmv_expand_slice(x, w_t_all, y, self.token_lora_indices, y_offset, y_slice_size, add_inputs)
+        self.bgmv_expand_slice(
+            x,
+            w_t_all,
+            y,
+            self._get_token_lora_indices(x),
+            y_offset,
+            y_slice_size,
+            add_inputs,
+        )
 
     def _apply_expand(
         self,
@@ -234,7 +245,7 @@ class PunicaWrapperNPU(PunicaWrapperBase):
         y = y.view(-1, y.shape[-1])
         offset_left = offset_start
         if lora_bias_stacked is not None:
-            self._apply_bias(self.token_lora_indices, y, output_slices, lora_bias_stacked)
+            self._apply_bias(self._get_token_lora_indices(y), y, output_slices, lora_bias_stacked)
         for slice_idx in range(len(lora_b_stacked)):
             self._apply_expand(
                 y,
@@ -349,7 +360,7 @@ class PunicaWrapperNPU(PunicaWrapperBase):
         if buffer is None:
             buffer = torch.zeros((x.size(0), r), dtype=torch.float32, device=x.device)
 
-        indices = self.sampler_indices
+        indices = torch.narrow(self._sampler_indices, 0, 0, x.size(0))
 
         self.bgmv_shrink(x, lora_a_stacked, buffer, indices, scale)
         self.bgmv_expand(buffer, lora_b_stacked, y, indices, add_inputs=True)
