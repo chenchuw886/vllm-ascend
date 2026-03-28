@@ -362,15 +362,6 @@ class AscendColumnParallelLinear(ColumnParallelLinear):
 
         self.gather_output = gather_output
 
-        # if output_sizes is None:
-        #     output_sizes = [output_size]
-
-        # CHANGED TO:
-        if output_sizes is None:
-            self.output_sizes = [output_size]  # Instance variable ✓
-        else:
-            self.output_sizes = output_sizes   # Instance variable ✓
-
         assert self.quant_method is not None
         self.quant_method.create_weights(
             layer=self,
