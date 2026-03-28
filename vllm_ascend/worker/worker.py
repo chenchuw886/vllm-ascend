@@ -298,12 +298,11 @@ class NPUWorker(WorkerBase):
         # Initialize device properties used by triton kernels.
         init_device_properties_triton()
 
-        # binding cpu
-        if get_ascend_config().enable_cpu_binding:
-            try:
-                bind_cpus(self.local_rank)
-            except Exception as e:
-                logger.warning(f"Bind cpus failed in rank{self.local_rank}: {e} Skip binding cpu.")
+        # NOTE: CPU binding is deferred to compile_or_warm_up_model() after
+        # all hot pages (NPUInputBatch, ACLGraph, ATB buffers) are allocated
+        # via first-touch. This allows migratepages to migrate the ~700MB
+        # shared remote pages (PyTorch dispatch tables, fork-inherited pages)
+        # without suppressing AutoNUMA during the initialization phase.
         return device
 
     def init_device(self):
@@ -479,6 +478,19 @@ class NPUWorker(WorkerBase):
         # may cause performance degradation at runtime.
         if get_ascend_device_type() != AscendDeviceType.A5:
             self._warm_up_atb()
+
+        # CPU binding: now all hot pages are allocated via first-touch:
+        # - NPUInputBatch pinned buffers (init_device -> model_runner)
+        # - ACLGraphEntry, graph pool (capture_model)
+        # - ATB internal buffers (_warm_up_atb)
+        # migratepages can now migrate the ~700MB shared remote pages
+        # (PyTorch dispatch tables, fork-inherited EngineCore pages).
+        if get_ascend_config().enable_cpu_binding:
+            try:
+                bind_cpus(self.local_rank)
+            except Exception as e:
+                logger.warning(f"Bind cpus failed in rank{self.local_rank}: {e} Skip binding cpu.")
+
         # Reset the seed to ensure that the random state is not affected by
         # the model initialization and profiling.
         set_random_seed(self.model_config.seed)
