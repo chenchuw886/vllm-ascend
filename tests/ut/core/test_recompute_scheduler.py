@@ -11,6 +11,7 @@ from vllm.sampling_params import SamplingParams
 from vllm.config import SchedulerConfig
 from vllm.utils.hashing import sha256
 from vllm.v1.core.kv_cache_utils import get_request_block_hasher, init_none_hash
+from vllm.v1.core.sched.request_queue import SchedulingPolicy
 from vllm.v1.core.sched.output import CachedRequestData, SchedulerOutput
 from vllm.v1.kv_cache_interface import FullAttentionSpec, KVCacheConfig, KVCacheGroupSpec
 from vllm.v1.outputs import DraftTokenIds, ModelRunnerOutput
@@ -1083,3 +1084,386 @@ def test_recompute_schedule_remote_kv_ready_new_request_becomes_waiting_and_runs
 
     assert len(output.scheduled_new_reqs) == 1
     assert output.scheduled_new_reqs[0].req_id == request.request_id
+
+
+def test_recompute_schedule_priority_preemption_rolls_back_scheduled_running_request():
+    scheduler = create_recompute_scheduler()
+    req0, req1 = create_requests(num_requests=2)
+    for index, request in enumerate((req0, req1)):
+        request.status = RequestStatus.RUNNING
+        request.priority = 10 - index * 10
+        request.arrival_time = index
+        scheduler.requests[request.request_id] = request
+        scheduler.running.append(request)
+
+    block0 = MagicMock()
+    block0.get_block_ids.return_value = ([1],)
+    block1 = MagicMock()
+    block1.get_block_ids.return_value = ([2],)
+    scheduler.policy = SchedulingPolicy.PRIORITY
+    scheduler.kv_cache_manager.allocate_slots = MagicMock(
+        side_effect=[block0, None, block1])
+
+    output = scheduler.schedule()
+
+    assert req0.request_id in output.preempted_req_ids
+    assert req0.request_id not in output.num_scheduled_tokens
+    assert req1.request_id in output.num_scheduled_tokens
+    assert req0.status == RequestStatus.PREEMPTED
+
+
+def test_recompute_schedule_records_connector_prefix_cache_stats():
+    scheduler = create_recompute_scheduler()
+    request = create_requests(num_requests=1, num_tokens=10)[0]
+    request.num_preemptions = 1
+    scheduler.add_request(request)
+    scheduler.connector = MagicMock()
+    scheduler.connector.get_num_new_matched_tokens.return_value = (2, False)
+    scheduler.connector.update_state_after_alloc = MagicMock()
+    scheduler.connector.build_connector_meta.return_value = None
+    scheduler.connector.take_events.return_value = None
+    scheduler.connector_prefix_cache_stats = MagicMock()
+
+    output = scheduler.schedule()
+
+    assert output.num_scheduled_tokens[request.request_id] > 0
+    scheduler.connector_prefix_cache_stats.record.assert_called_once_with(
+        num_tokens=request.num_tokens,
+        num_hits=2,
+        preempted=True,
+    )
+
+
+def test_recompute_schedule_waiting_streaming_request_is_skipped():
+    scheduler = create_recompute_scheduler()
+    request = create_requests(num_requests=1)[0]
+    scheduler.add_request(request)
+    request.status = RequestStatus.WAITING_FOR_STREAMING_REQ
+    request.streaming_queue = deque()
+
+    output = scheduler.schedule()
+
+    assert output.total_num_scheduled_tokens == 0
+    assert len(scheduler.waiting) == 1
+    assert scheduler.waiting.peek_request().request_id == request.request_id
+
+
+def test_recompute_schedule_use_v2_model_runner_promotes_resumed_request_to_new():
+    scheduler = create_recompute_scheduler()
+    request = create_requests(num_requests=1)[0]
+    scheduler.add_request(request)
+    request.status = RequestStatus.PREEMPTED
+    scheduler.use_v2_model_runner = True
+
+    output = scheduler.schedule()
+
+    assert len(output.scheduled_new_reqs) == 1
+    assert output.scheduled_new_reqs[0].req_id == request.request_id
+    assert output.scheduled_cached_reqs.num_reqs == 0
+
+
+def test_recompute_schedule_skips_waiting_request_when_lora_budget_full():
+    scheduler = create_recompute_scheduler()
+    running_req, waiting_req = create_requests(num_requests=2)
+    running_req.status = RequestStatus.RUNNING
+    running_req.lora_request = SimpleNamespace(lora_int_id=1)
+    waiting_req.lora_request = SimpleNamespace(lora_int_id=2)
+    scheduler.requests[running_req.request_id] = running_req
+    scheduler.running.append(running_req)
+    scheduler.add_request(waiting_req)
+    scheduler.lora_config = SimpleNamespace(max_loras=1)
+
+    output = scheduler.schedule()
+
+    assert running_req.request_id in output.num_scheduled_tokens
+    assert waiting_req.request_id not in output.num_scheduled_tokens
+    assert len(scheduler.waiting) == 1
+
+
+def test_recompute_schedule_running_request_trims_spec_tokens_and_updates_ec_connector():
+    scheduler = create_recompute_scheduler()
+    scheduler.scheduler_config.long_prefill_token_threshold = 2
+    request = create_requests(
+        num_requests=1,
+        num_tokens=10,
+        mm_positions=[[PlaceholderRange(offset=0, length=10)]],
+    )[0]
+    request.status = RequestStatus.RUNNING
+    request.spec_token_ids = [11, 12, 13]
+    request.num_computed_tokens = request.num_tokens
+    request.lora_request = SimpleNamespace(lora_int_id=4)
+    scheduler.requests[request.request_id] = request
+    scheduler.running.append(request)
+    scheduler.ec_connector = MagicMock()
+    scheduler._try_schedule_encoder_inputs = MagicMock(
+        return_value=([0], 2, scheduler.max_num_encoder_input_tokens - 10, [0]))
+
+    output = scheduler.schedule()
+
+    assert output.num_scheduled_tokens[request.request_id] == 2
+    assert output.scheduled_spec_decode_tokens[request.request_id] == [11, 12]
+    assert output.scheduled_encoder_inputs[request.request_id] == [0]
+    scheduler.ec_connector.update_state_after_alloc.assert_called_once_with(
+        request, 0)
+    assert request.spec_token_ids == []
+
+
+def test_recompute_schedule_resumed_mtp_request_tracks_spec_tokens_and_external_encoder_load():
+    scheduler = create_recompute_scheduler()
+    scheduler.is_mtp_kv_consumer = True
+    scheduler.num_spec_tokens = 2
+    request = create_requests(
+        num_requests=1,
+        num_tokens=5,
+        mm_positions=[[PlaceholderRange(offset=0, length=10)]],
+    )[0]
+    scheduler.add_request(request)
+    request.status = RequestStatus.PREEMPTED
+    request.num_computed_tokens = request.num_tokens
+    request.spec_token_ids = [21, 22, 23]
+    scheduler.ec_connector = MagicMock()
+    scheduler._try_schedule_encoder_inputs = MagicMock(
+        return_value=([0], 3, scheduler.max_num_encoder_input_tokens - 10, [0]))
+
+    output = scheduler.schedule()
+
+    assert len(output.scheduled_new_reqs) == 0
+    assert output.scheduled_cached_reqs.num_reqs == 1
+    assert output.scheduled_spec_decode_tokens[request.request_id] == [21, 22, 23]
+    scheduler.ec_connector.update_state_after_alloc.assert_called_once_with(
+        request, 0)
+    assert request.status == RequestStatus.RUNNING
+    assert request.spec_token_ids == []
+
+
+def test_recompute_update_from_output_returns_recomputed_output_and_perf_stats():
+    scheduler = create_recompute_scheduler()
+    scheduler.finished_req_ids_dict = {}
+    scheduler.make_stats = MagicMock(return_value="stats")
+    scheduler.perf_metrics = MagicMock()
+    scheduler.perf_metrics.is_enabled.return_value = True
+    scheduler.perf_metrics.get_step_perf_stats_per_gpu.return_value = "perf"
+    scheduler.connector = MagicMock()
+    scheduler.connector.get_kv_connector_stats.return_value = None
+    scheduler.connector.take_events.return_value = ["connector-event"]
+    scheduler.kv_cache_manager.take_events = MagicMock(return_value=None)
+    scheduler.kv_event_publisher.publish = MagicMock()
+
+    scheduler_output = RecomputeSchedulerOutput(
+        scheduled_new_reqs=[],
+        scheduled_cached_reqs=CachedRequestData.make_empty(),
+        num_scheduled_tokens={},
+        total_num_scheduled_tokens=0,
+        scheduled_encoder_inputs={},
+        scheduled_spec_decode_tokens={},
+        num_common_prefix_blocks=[],
+        finished_req_ids=set(),
+        free_encoder_mm_hashes=[],
+        recomputed_reqs=[
+            SimpleNamespace(request_id="recomp", output_token_ids=[1], client_index=5)
+        ],
+    )
+    model_output = ModelRunnerOutput(
+        req_ids=[],
+        req_id_to_index={},
+        sampled_token_ids=[],
+        logprobs=None,
+        prompt_logprobs_dict={},
+        pooler_output=[],
+    )
+
+    outputs = scheduler.update_from_output(scheduler_output, model_output)
+
+    assert outputs[5].outputs[0].request_id == "recomp"
+    assert outputs[5].outputs[0].stop_reason == "recomputed"
+    assert outputs[5].scheduler_stats == "stats"
+    published_batch = scheduler.kv_event_publisher.publish.call_args[0][0]
+    assert published_batch.events == ["connector-event"]
+
+
+def test_recompute_update_from_output_adds_finished_requests_for_absent_client():
+    scheduler = create_recompute_scheduler()
+    scheduler.make_stats = MagicMock(return_value=None)
+    scheduler.finished_req_ids_dict = {9: {"finished-only"}}
+
+    scheduler_output = RecomputeSchedulerOutput(
+        scheduled_new_reqs=[],
+        scheduled_cached_reqs=CachedRequestData.make_empty(),
+        num_scheduled_tokens={},
+        total_num_scheduled_tokens=0,
+        scheduled_encoder_inputs={},
+        scheduled_spec_decode_tokens={},
+        num_common_prefix_blocks=[],
+        finished_req_ids=set(),
+        free_encoder_mm_hashes=[],
+        recomputed_reqs=[],
+    )
+    model_output = ModelRunnerOutput(
+        req_ids=[],
+        req_id_to_index={},
+        sampled_token_ids=[],
+        logprobs=None,
+        prompt_logprobs_dict={},
+        pooler_output=[],
+    )
+
+    outputs = scheduler.update_from_output(scheduler_output, model_output)
+
+    assert outputs[9].finished_requests == {"finished-only"}
+
+
+def test_recompute_schedule_breaks_when_running_queue_is_full():
+    scheduler = create_recompute_scheduler()
+    running_req, waiting_req = create_requests(num_requests=2)
+    running_req.status = RequestStatus.RUNNING
+    scheduler.requests[running_req.request_id] = running_req
+    scheduler.running.append(running_req)
+    scheduler.add_request(waiting_req)
+    scheduler.max_num_running_reqs = 1
+
+    output = scheduler.schedule()
+
+    assert waiting_req.request_id not in output.num_scheduled_tokens
+    assert len(scheduler.waiting) == 1
+
+
+def test_recompute_schedule_waiting_request_applies_long_prefill_threshold():
+    scheduler = create_recompute_scheduler()
+    scheduler.scheduler_config.long_prefill_token_threshold = 2
+    request = create_requests(num_requests=1, num_tokens=10)[0]
+    scheduler.add_request(request)
+
+    output = scheduler.schedule()
+
+    assert output.num_scheduled_tokens[request.request_id] == 2
+
+
+def test_recompute_schedule_waiting_encoder_request_breaks_when_encoder_schedule_zeroes_tokens():
+    scheduler = create_recompute_scheduler()
+    request = create_requests(
+        num_requests=1,
+        num_tokens=10,
+        mm_positions=[[PlaceholderRange(offset=0, length=10)]],
+    )[0]
+    scheduler.add_request(request)
+    scheduler._try_schedule_encoder_inputs = MagicMock(
+        return_value=([0], 0, scheduler.max_num_encoder_input_tokens, []))
+
+    output = scheduler.schedule()
+
+    assert output.total_num_scheduled_tokens == 0
+    assert len(scheduler.waiting) == 1
+
+
+def test_recompute_schedule_waiting_mtp_request_clears_spec_tokens_without_recording_them():
+    scheduler = create_recompute_scheduler()
+    scheduler.is_mtp_kv_consumer = True
+    request = create_requests(num_requests=1, num_tokens=5)[0]
+    scheduler.add_request(request)
+    request.status = RequestStatus.PREEMPTED
+    request.num_computed_tokens = request.num_tokens
+    request.num_output_placeholders = 4
+    request.spec_token_ids = [41, 42, 43]
+
+    output = scheduler.schedule()
+
+    assert request.request_id not in output.scheduled_spec_decode_tokens
+    assert request.spec_token_ids == []
+
+
+def test_recompute_schedule_waiting_mtp_request_truncates_spec_tokens():
+    scheduler = create_recompute_scheduler()
+    scheduler.is_mtp_kv_consumer = True
+    scheduler.scheduler_config.long_prefill_token_threshold = 2
+    request = create_requests(num_requests=1, num_tokens=5)[0]
+    scheduler.add_request(request)
+    request.status = RequestStatus.PREEMPTED
+    request.num_computed_tokens = request.num_tokens
+    request.spec_token_ids = [51, 52, 53, 54]
+
+    output = scheduler.schedule()
+
+    assert output.scheduled_spec_decode_tokens[request.request_id] == [51, 52]
+    assert request.spec_token_ids == []
+
+
+def test_recompute_schedule_preserves_non_negative_cached_token_count():
+    scheduler = create_recompute_scheduler()
+    request = create_requests(num_requests=1)[0]
+    scheduler.add_request(request)
+    request.num_cached_tokens = 0
+
+    scheduler.schedule()
+
+    assert request.num_cached_tokens == 0
+
+
+def test_recompute_update_from_output_with_no_visible_output_returns_nothing():
+    scheduler = create_recompute_scheduler()
+    request = create_requests(num_requests=1)[0]
+    request.status = RequestStatus.RUNNING
+    scheduler.requests[request.request_id] = request
+    scheduler.running.append(request)
+    scheduler.finished_req_ids_dict = {}
+    scheduler.make_stats = MagicMock(return_value=None)
+
+    scheduler_output = RecomputeSchedulerOutput(
+        scheduled_new_reqs=[],
+        scheduled_cached_reqs=CachedRequestData.make_empty(),
+        num_scheduled_tokens={request.request_id: 1},
+        total_num_scheduled_tokens=1,
+        scheduled_encoder_inputs={},
+        scheduled_spec_decode_tokens={},
+        num_common_prefix_blocks=[],
+        finished_req_ids=set(),
+        free_encoder_mm_hashes=[],
+        recomputed_reqs=[],
+    )
+    model_output = ModelRunnerOutput(
+        req_ids=[request.request_id],
+        req_id_to_index={request.request_id: 0},
+        sampled_token_ids=[[]],
+        logprobs=None,
+        prompt_logprobs_dict={},
+        pooler_output=[None],
+    )
+
+    outputs = scheduler.update_from_output(scheduler_output, model_output)
+
+    assert outputs == {}
+
+
+def test_recompute_update_from_output_merges_cache_and_connector_events():
+    scheduler = create_recompute_scheduler()
+    scheduler.finished_req_ids_dict = {}
+    scheduler.make_stats = MagicMock(return_value=None)
+    scheduler.connector = MagicMock()
+    scheduler.connector.take_events.return_value = ["connector"]
+    scheduler.kv_cache_manager.take_events = MagicMock(return_value=["kv"])
+    scheduler.kv_event_publisher.publish = MagicMock()
+
+    scheduler_output = RecomputeSchedulerOutput(
+        scheduled_new_reqs=[],
+        scheduled_cached_reqs=CachedRequestData.make_empty(),
+        num_scheduled_tokens={},
+        total_num_scheduled_tokens=0,
+        scheduled_encoder_inputs={},
+        scheduled_spec_decode_tokens={},
+        num_common_prefix_blocks=[],
+        finished_req_ids=set(),
+        free_encoder_mm_hashes=[],
+        recomputed_reqs=[],
+    )
+    model_output = ModelRunnerOutput(
+        req_ids=[],
+        req_id_to_index={},
+        sampled_token_ids=[],
+        logprobs=None,
+        prompt_logprobs_dict={},
+        pooler_output=[],
+    )
+
+    scheduler.update_from_output(scheduler_output, model_output)
+
+    published_batch = scheduler.kv_event_publisher.publish.call_args[0][0]
+    assert published_batch.events == ["kv", "connector"]

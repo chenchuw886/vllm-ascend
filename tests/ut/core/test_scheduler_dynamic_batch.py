@@ -1023,3 +1023,95 @@ class TestSchedulerDynamicBatch(TestBase):
 
         published_batch = scheduler.kv_event_publisher.publish.call_args[0][0]
         self.assertEqual(published_batch.events, ["kv", "connector"])
+
+    def test_schedule_publishes_connector_events_when_cache_events_absent(self):
+        scheduler = self.create_scheduler()
+        request = create_requests(num_requests=1)[0]
+        scheduler.add_request(request)
+        scheduler.kv_cache_manager.take_events = MagicMock(return_value=None)
+        scheduler.kv_event_publisher.publish = MagicMock()
+        scheduler.connector = MagicMock()
+        scheduler.connector.get_num_new_matched_tokens.return_value = (0, False)
+        scheduler.connector.build_connector_meta.return_value = None
+        scheduler.connector.take_events.return_value = ["connector-only"]
+        scheduler.connector.update_state_after_alloc = MagicMock()
+
+        scheduler.schedule()
+
+        published_batch = scheduler.kv_event_publisher.publish.call_args[0][0]
+        self.assertEqual(published_batch.events, ["connector-only"])
+
+    def test_schedule_running_encoder_request_respects_long_prefill_threshold(self):
+        scheduler = self.create_scheduler()
+        scheduler.scheduler_config.long_prefill_token_threshold = 3
+        request = create_requests(
+            num_requests=1,
+            num_tokens=10,
+            mm_positions=[[PlaceholderRange(offset=0, length=10)]],
+        )[0]
+        request.status = RequestStatus.RUNNING
+        scheduler.requests[request.request_id] = request
+        scheduler.running.append(request)
+        scheduler._try_schedule_encoder_inputs = MagicMock(
+            return_value=([0], 3, scheduler.max_num_encoder_input_tokens - 10))
+
+        output = scheduler.schedule()
+
+        self.assertEqual(output.num_scheduled_tokens[request.request_id], 3)
+        self.assertEqual(output.scheduled_encoder_inputs[request.request_id], [0])
+
+    def test_schedule_resumed_request_keeps_existing_cached_token_count(self):
+        scheduler = self.create_scheduler()
+        request = create_requests(num_requests=1)[0]
+        scheduler.add_request(request)
+        request.status = RequestStatus.PREEMPTED
+        request.num_computed_tokens = 2
+        request.num_cached_tokens = 5
+        request.lora_request = SimpleNamespace(lora_int_id=7)
+        scheduler.kv_cache_manager.create_empty_block_list = MagicMock(
+            return_value=scheduler.kv_cache_manager.empty_kv_cache_blocks)
+
+        output = scheduler.schedule()
+
+        self.assertEqual(output.scheduled_cached_reqs.num_reqs, 1)
+        self.assertEqual(request.num_cached_tokens, 5)
+        self.assertEqual(request.status, RequestStatus.RUNNING)
+
+    def test_schedule_waiting_request_applies_long_prefill_threshold(self):
+        scheduler = self.create_scheduler()
+        scheduler.scheduler_config.long_prefill_token_threshold = 2
+        request = create_requests(num_requests=1, num_tokens=10)[0]
+        scheduler.add_request(request)
+
+        output = scheduler.schedule()
+
+        self.assertEqual(output.num_scheduled_tokens[request.request_id], 2)
+
+    def test_schedule_waiting_encoder_request_breaks_when_encoder_budget_zeroes_tokens(
+            self):
+        scheduler = self.create_scheduler()
+        request = create_requests(
+            num_requests=1,
+            num_tokens=10,
+            mm_positions=[[PlaceholderRange(offset=0, length=10)]],
+        )[0]
+        scheduler.add_request(request)
+        scheduler._try_schedule_encoder_inputs = MagicMock(
+            return_value=([0], 0, scheduler.max_num_encoder_input_tokens, []))
+
+        output = scheduler.schedule()
+
+        self.assertEqual(output.total_num_scheduled_tokens, 0)
+        self.assertEqual(len(scheduler.waiting), 1)
+
+    def test_schedule_waiting_request_breaks_when_allocation_fails(self):
+        scheduler = self.create_scheduler()
+        request = create_requests(num_requests=1)[0]
+        scheduler.add_request(request)
+        scheduler.kv_cache_manager.allocate_slots = MagicMock(return_value=None)
+
+        output = scheduler.schedule()
+
+        self.assertEqual(output.total_num_scheduled_tokens, 0)
+        self.assertEqual(len(scheduler.running), 0)
+        self.assertEqual(len(scheduler.waiting), 1)
