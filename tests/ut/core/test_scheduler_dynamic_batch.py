@@ -1,17 +1,21 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import os
+from types import SimpleNamespace
 from typing import Any, Dict, List, Optional, Tuple
 from unittest.mock import MagicMock, patch
 
 import torch
-from vllm.config import (CacheConfig, KVTransferConfig, ModelConfig,
-                         SchedulerConfig, SpeculativeConfig, VllmConfig)
+from vllm.config import (CacheConfig, DeviceConfig, KVTransferConfig,
+                         ModelConfig, SchedulerConfig, SpeculativeConfig,
+                         VllmConfig)
 from vllm.multimodal.inputs import (MultiModalFeatureSpec,
                                     MultiModalKwargsItem, PlaceholderRange)
 from vllm.sampling_params import SamplingParams
 from vllm.utils.hashing import sha256
 from vllm.v1.core.kv_cache_utils import (get_request_block_hasher,
                                          init_none_hash)
+from vllm.v1.core.sched.request_queue import SchedulingPolicy
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.kv_cache_interface import (FullAttentionSpec, KVCacheConfig,
                                         KVCacheGroupSpec)
@@ -33,6 +37,46 @@ NUM_SPECULATIVE_TOKENS = None
 MAX_NUM_SEQS = 16
 
 
+class DummyProcessorInfo:
+
+    supported_mm_limits = {"image": 1}
+    allowed_mm_limits = {"image": 1}
+
+    @staticmethod
+    def get_mm_max_tokens_per_item(seq_len, mm_counts):
+        del seq_len, mm_counts
+        return {"image": 10}
+
+
+class DummyProcessor:
+
+    def __init__(self):
+        self.info = DummyProcessorInfo()
+
+
+class DummyMMRegistry:
+
+    @staticmethod
+    def supports_multimodal_inputs(model_config):
+        del model_config
+        return True
+
+    @staticmethod
+    def processor_only_cache_from_config(vllm_config):
+        del vllm_config
+        return None
+
+    @staticmethod
+    def create_processor(model_config, cache=None):
+        del model_config, cache
+        return DummyProcessor()
+
+    @staticmethod
+    def get_dummy_mm_inputs(model_config, mm_counts, processor):
+        del model_config, mm_counts, processor
+        return {"mm_placeholders": {"image": []}}
+
+
 def create_requests(
     num_requests: int,
     num_tokens: int = 10,
@@ -48,6 +92,7 @@ def create_requests(
                                      max_tokens=max_tokens,
                                      stop_token_ids=stop_token_ids,
                                      prompt_logprobs=prompt_logprobs)
+    sampling_params._eos_token_id = EOS_TOKEN_ID
     requests = []
     for i in range(num_requests):
         mm_features = []
@@ -56,7 +101,7 @@ def create_requests(
             for j, position in enumerate(mm_position):
                 identifier = f"hash{i}_{j}"
                 mm_feature = MultiModalFeatureSpec(
-                    data=MultiModalKwargsItem.dummy("dummy_m"),
+                    data=MultiModalKwargsItem.dummy(1),
                     mm_position=position,
                     identifier=identifier,
                     modality="image")
@@ -64,7 +109,6 @@ def create_requests(
         request = Request(request_id=f"{i}",
                           prompt_token_ids=[i] * num_tokens,
                           sampling_params=sampling_params,
-                          eos_token_id=EOS_TOKEN_ID,
                           pooling_params=None,
                           mm_features=mm_features if mm_features else None,
                           block_hasher=get_request_block_hasher(
@@ -98,14 +142,13 @@ class TestSchedulerDynamicBatch(TestBase):
 
     @patch("vllm.config.ModelConfig.__post_init__", MagicMock())
     @patch("vllm.config.VllmConfig.__post_init__", MagicMock())
-    @patch('vllm.v1.core.sched.scheduler.compute_encoder_budget')
-    def create_scheduler(self, mock_compute_encoder_budget):
-        mock_compute_encoder_budget.return_value = [100, 100]
+    def create_scheduler(self):
         use_kv_connector = False
         block_size = 16
 
         scheduler_config = SchedulerConfig(
             max_num_seqs=16,
+            is_encoder_decoder=False,
             max_model_len=MAX_NUM_BATCHED_TOKENS,
             long_prefill_token_threshold=LONG_PREFILL_TOKEN_THRESHOLD,
             disable_chunked_mm_input=False,
@@ -118,18 +161,18 @@ class TestSchedulerDynamicBatch(TestBase):
         scheduler_config.chunked_prefill_enabled = True
         scheduler_config.SLO_limits_for_dynamic_batch = 0
 
+        fake_weight_path = os.path.join(os.path.dirname(__file__), "..", "fake_weight")
         model_config = ModelConfig(
-            model=MODEL,
-            task="auto",
-            tokenizer=MODEL,
-            tokenizer_mode="auto",
-            trust_remote_code=True,
+            model=fake_weight_path,
+            tokenizer=fake_weight_path,
+            skip_tokenizer_init=True,
             dtype="float16",
             seed=42,
             max_model_len=MAX_NUM_BATCHED_TOKENS,
         )
         model_config.pooler_config = MagicMock()
         model_config.multimodal_config = MagicMock()
+        model_config.__dict__["is_encoder_decoder"] = False
         model_config.hf_text_config = MagicMock()
         model_config.hf_text_config.is_encoder_decoder = False
         # Cache config, optionally force APC
@@ -163,6 +206,7 @@ class TestSchedulerDynamicBatch(TestBase):
             cache_config=cache_config,
             kv_transfer_config=kv_transfer_config,
             speculative_config=speculative_config,
+            device_config=DeviceConfig("cpu"),
         )
 
         kv_cache_config = KVCacheConfig(
@@ -170,8 +214,10 @@ class TestSchedulerDynamicBatch(TestBase):
             kv_cache_tensors=[],
             kv_cache_groups=[
                 KVCacheGroupSpec(['layer'],
-                                 FullAttentionSpec(block_size, 1, 1,
-                                                   torch.float32, False))
+                                 FullAttentionSpec(block_size=block_size,
+                                                   num_kv_heads=1,
+                                                   head_size=1,
+                                                   dtype=torch.float32))
             ],
         )
         kv_cache_config.hash_block_size = block_size
@@ -182,6 +228,7 @@ class TestSchedulerDynamicBatch(TestBase):
             kv_cache_config=kv_cache_config,
             block_size=block_size,
             log_stats=True,
+            mm_registry=DummyMMRegistry(),
             structured_output_manager=MagicMock(spec=StructuredOutputManager),
         )
 
@@ -470,6 +517,7 @@ class TestSchedulerDynamicBatch(TestBase):
         scheduler = self.create_scheduler()
         requests = create_requests(num_requests=1, max_tokens=10)
         requests[0].sampling_params.ignore_eos = True
+        requests[0].sampling_params._eos_token_id = None
         requests[0].num_computed_tokens = requests[0].num_tokens
         scheduler.requests[requests[0].request_id] = requests[0]
         scheduler.running.append(requests[0])
@@ -748,3 +796,230 @@ class TestSchedulerDynamicBatch(TestBase):
 
         # Confirm no memory leak.
         self.assert_scheduler_empty(scheduler)
+
+    def test_schedule_running_request_with_zero_new_tokens_still_schedules_waiting(self):
+        scheduler = self.create_scheduler()
+        running_req, waiting_req = create_requests(num_requests=2)
+
+        running_req.status = RequestStatus.RUNNING
+        running_req.num_computed_tokens = running_req.num_tokens_with_spec
+        scheduler.requests[running_req.request_id] = running_req
+        scheduler.running.append(running_req)
+        scheduler.add_request(waiting_req)
+
+        output = scheduler.schedule()
+
+        self.assertEqual(len(output.scheduled_new_reqs), 1)
+        self.assertEqual(output.scheduled_new_reqs[0].req_id,
+                 waiting_req.request_id)
+        self.assertEqual(output.num_scheduled_tokens[waiting_req.request_id],
+                 waiting_req.num_tokens)
+        self.assertEqual(len(scheduler.running), 2)
+        self.assertEqual(len(scheduler.waiting), 0)
+
+    def test_schedule_skips_waiting_remote_and_fsm_requests(self):
+        scheduler = self.create_scheduler()
+        requests = create_requests(num_requests=3)
+        for request in requests:
+            scheduler.add_request(request)
+
+        requests[0].status = RequestStatus.WAITING_FOR_REMOTE_KVS
+        requests[1].status = RequestStatus.WAITING_FOR_FSM
+        requests[1].structured_output_request = MagicMock(grammar=None)
+        scheduler._update_waiting_for_remote_kv = MagicMock(return_value=False)
+
+        output = scheduler.schedule()
+
+        self.assertEqual(len(output.scheduled_new_reqs), 1)
+        self.assertEqual(output.scheduled_new_reqs[0].req_id,
+                         requests[2].request_id)
+        self.assertEqual(len(scheduler.running), 1)
+        self.assertEqual(scheduler.running[0].request_id,
+                         requests[2].request_id)
+        self.assertEqual(len(scheduler.waiting), 2)
+        self.assertEqual(requests[0].status,
+                         RequestStatus.WAITING_FOR_REMOTE_KVS)
+        self.assertEqual(requests[1].status, RequestStatus.WAITING_FOR_FSM)
+
+    def test_schedule_async_kv_load_keeps_request_waiting_for_remote(self):
+        scheduler = self.create_scheduler()
+        request = create_requests(num_requests=1)[0]
+        scheduler.add_request(request)
+
+        scheduler.connector = MagicMock()
+        scheduler.connector.get_num_new_matched_tokens.return_value = (2, True)
+        scheduler.connector.update_state_after_alloc = MagicMock()
+        scheduler.connector.build_connector_meta.return_value = None
+        scheduler.connector.take_events.return_value = None
+
+        output = scheduler.schedule()
+
+        self.assertEqual(output.total_num_scheduled_tokens, 0)
+        self.assertEqual(len(scheduler.running), 0)
+        self.assertEqual(len(scheduler.waiting), 1)
+        self.assertEqual(request.status, RequestStatus.WAITING_FOR_REMOTE_KVS)
+        scheduler.connector.update_state_after_alloc.assert_called_once()
+
+    def test_schedule_preempts_running_request_when_allocation_fails(self):
+        scheduler = self.create_scheduler()
+        request = create_requests(num_requests=1)[0]
+
+        request.status = RequestStatus.RUNNING
+        scheduler.requests[request.request_id] = request
+        scheduler.running.append(request)
+        scheduler.kv_cache_manager.allocate_slots = MagicMock(return_value=None)
+        scheduler.kv_cache_manager.free = MagicMock()
+
+        output = scheduler.schedule()
+
+        self.assertEqual(output.total_num_scheduled_tokens, 0)
+        self.assertEqual(len(scheduler.running), 0)
+        self.assertEqual(len(scheduler.waiting), 1)
+        self.assertEqual(request.status, RequestStatus.PREEMPTED)
+        scheduler.kv_cache_manager.free.assert_called_once_with(request)
+
+    def test_schedule_resumes_preempted_request_from_waiting(self):
+        scheduler = self.create_scheduler()
+        request = create_requests(num_requests=1)[0]
+        scheduler.add_request(request)
+        request.status = RequestStatus.PREEMPTED
+
+        output = scheduler.schedule()
+
+        self.assertEqual(len(output.scheduled_new_reqs), 0)
+        self.assertEqual(output.scheduled_cached_reqs.num_reqs, 1)
+        self.assertEqual(len(scheduler.running), 1)
+        self.assertEqual(scheduler.running[0].status, RequestStatus.RUNNING)
+
+    def test_schedule_ready_remote_kv_request_is_scheduled(self):
+        scheduler = self.create_scheduler()
+        request = create_requests(num_requests=1)[0]
+        scheduler.add_request(request)
+        request.status = RequestStatus.WAITING_FOR_REMOTE_KVS
+        scheduler._update_waiting_for_remote_kv = MagicMock(return_value=True)
+
+        output = scheduler.schedule()
+
+        self.assertEqual(len(output.scheduled_new_reqs), 1)
+        self.assertEqual(output.scheduled_new_reqs[0].req_id,
+                         request.request_id)
+        self.assertEqual(len(scheduler.running), 1)
+        self.assertEqual(request.status, RequestStatus.RUNNING)
+
+    def test_schedule_skips_request_when_connector_match_unknown(self):
+        scheduler = self.create_scheduler()
+        request = create_requests(num_requests=1)[0]
+        scheduler.add_request(request)
+
+        scheduler.connector = MagicMock()
+        scheduler.connector.get_num_new_matched_tokens.return_value = (None,
+                                                                       False)
+        scheduler.connector.build_connector_meta.return_value = None
+        scheduler.connector.take_events.return_value = None
+
+        output = scheduler.schedule()
+
+        self.assertEqual(output.total_num_scheduled_tokens, 0)
+        self.assertEqual(len(scheduler.running), 0)
+        self.assertEqual(len(scheduler.waiting), 1)
+        self.assertEqual(scheduler.waiting.peek_request().request_id,
+                         request.request_id)
+
+    def test_schedule_breaks_when_chunked_prefill_disabled_and_budget_too_small(
+            self):
+        scheduler = self.create_scheduler()
+        scheduler.scheduler_config.enable_chunked_prefill = False
+        scheduler.max_num_scheduled_tokens = 1
+        request = create_requests(num_requests=1, num_tokens=10)[0]
+        scheduler.add_request(request)
+
+        output = scheduler.schedule()
+
+        self.assertEqual(output.total_num_scheduled_tokens, 0)
+        self.assertEqual(len(output.scheduled_new_reqs), 0)
+        self.assertEqual(len(scheduler.waiting), 1)
+
+    def test_schedule_skips_waiting_request_when_lora_budget_is_full(self):
+        scheduler = self.create_scheduler()
+        running_req, waiting_req = create_requests(num_requests=2)
+        running_req.status = RequestStatus.RUNNING
+        running_req.lora_request = SimpleNamespace(lora_int_id=1)
+        waiting_req.lora_request = SimpleNamespace(lora_int_id=2)
+        scheduler.requests[running_req.request_id] = running_req
+        scheduler.running.append(running_req)
+        scheduler.add_request(waiting_req)
+        scheduler.lora_config = SimpleNamespace(max_loras=1)
+
+        output = scheduler.schedule()
+
+        self.assertIn(running_req.request_id, output.num_scheduled_tokens)
+        self.assertNotIn(waiting_req.request_id, output.num_scheduled_tokens)
+        self.assertEqual(len(scheduler.waiting), 1)
+
+    def test_schedule_priority_preempts_highest_priority_running_request(self):
+        scheduler = self.create_scheduler()
+        req0, req1 = create_requests(num_requests=2)
+        for index, request in enumerate((req0, req1)):
+            request.status = RequestStatus.RUNNING
+            request.priority = index
+            request.arrival_time = index
+            scheduler.requests[request.request_id] = request
+            scheduler.running.append(request)
+
+        scheduler.policy = SchedulingPolicy.PRIORITY
+        scheduler.kv_cache_manager.allocate_slots = MagicMock(return_value=None)
+        scheduler.kv_cache_manager.free = MagicMock()
+
+        output = scheduler.schedule()
+
+        self.assertEqual(output.total_num_scheduled_tokens, 0)
+        self.assertEqual(len(scheduler.running), 0)
+        self.assertEqual(len(scheduler.waiting), 2)
+        self.assertEqual(req1.status, RequestStatus.PREEMPTED)
+
+    def test_schedule_stops_waiting_when_running_at_sequence_cap(self):
+        scheduler = self.create_scheduler()
+        running_req, waiting_req = create_requests(num_requests=2)
+        running_req.status = RequestStatus.RUNNING
+        scheduler.requests[running_req.request_id] = running_req
+        scheduler.running.append(running_req)
+        scheduler.add_request(waiting_req)
+        scheduler.max_num_running_reqs = 1
+
+        output = scheduler.schedule()
+
+        self.assertEqual(output.total_num_scheduled_tokens,
+                         running_req.num_tokens)
+        self.assertEqual(len(output.scheduled_new_reqs), 0)
+        self.assertEqual(len(scheduler.waiting), 1)
+
+    def test_schedule_fsm_ready_request_returns_to_waiting_and_runs(self):
+        scheduler = self.create_scheduler()
+        request = create_requests(num_requests=1)[0]
+        scheduler.add_request(request)
+        request.status = RequestStatus.WAITING_FOR_FSM
+        request.structured_output_request = SimpleNamespace(grammar=object())
+
+        output = scheduler.schedule()
+
+        self.assertEqual(len(output.scheduled_new_reqs), 1)
+        self.assertEqual(output.scheduled_new_reqs[0].req_id,
+                         request.request_id)
+        self.assertEqual(request.status, RequestStatus.RUNNING)
+
+    def test_schedule_publishes_combined_cache_and_connector_events(self):
+        scheduler = self.create_scheduler()
+        request = create_requests(num_requests=1)[0]
+        scheduler.add_request(request)
+        scheduler.kv_cache_manager.take_events = MagicMock(return_value=["kv"])
+        scheduler.kv_event_publisher.publish = MagicMock()
+        scheduler.connector = MagicMock()
+        scheduler.connector.get_num_new_matched_tokens.return_value = (0, False)
+        scheduler.connector.build_connector_meta.return_value = None
+        scheduler.connector.take_events.return_value = ["connector"]
+        scheduler.connector.update_state_after_alloc = MagicMock()
+
+        scheduler.schedule()
+
+        published_batch = scheduler.kv_event_publisher.publish.call_args[0][0]
+        self.assertEqual(published_batch.events, ["kv", "connector"])
