@@ -75,21 +75,64 @@ class TestFunction(TestBase):
 
 class TestHCLLLibrary(TestBase):
 
+    def setUp(self):
+        super().setUp()
+        self._orig_path_to_library_cache = HCCLLibrary.path_to_library_cache.copy()
+        self._orig_path_to_dict_mapping = HCCLLibrary.path_to_dict_mapping.copy()
+        HCCLLibrary.path_to_library_cache.clear()
+        HCCLLibrary.path_to_dict_mapping.clear()
+
+    def tearDown(self):
+        HCCLLibrary.path_to_library_cache = self._orig_path_to_library_cache
+        HCCLLibrary.path_to_dict_mapping = self._orig_path_to_dict_mapping
+        super().tearDown()
+
     def test_init_with_nonexistent_so(self):
         fake_path = "/definitely/not/exist/libhccl.so"
         with self.assertRaises(OSError):
             HCCLLibrary(fake_path)
 
-    def test_hccl_get_error_string(self):
-        lib = MagicMock(sepc=HCCLLibrary)
-        mock_fn = MagicMock()
-        mock_fn.return_value = "HCCL internal error"
-        lib.hcclGetErrorString = mock_fn
+    @patch("vllm_ascend.distributed.device_communicators.pyhccl_wrapper.find_hccl_library", return_value="/fake/libhccl.so")
+    @patch("vllm_ascend.distributed.device_communicators.pyhccl_wrapper.ctypes.CDLL")
+    def test_init_loads_library_and_exports_functions(self, mock_cdll, _mock_find_hccl_library):
+        fake_lib = MagicMock()
+        for func in HCCLLibrary.exported_functions:
+            setattr(fake_lib, func.name, MagicMock())
+        mock_cdll.return_value = fake_lib
 
-        result = hcclResult_t(1)
-        msg = lib.hcclGetErrorString(result)
+        lib = HCCLLibrary()
+
+        self.assertIs(lib.lib, fake_lib)
+        self.assertEqual(set(lib._funcs.keys()), {func.name for func in HCCLLibrary.exported_functions})
+        mock_cdll.assert_called_once_with("/fake/libhccl.so")
+        self.assertIn("/fake/libhccl.so", HCCLLibrary.path_to_library_cache)
+        self.assertIn("/fake/libhccl.so", HCCLLibrary.path_to_dict_mapping)
+        for func in HCCLLibrary.exported_functions:
+            exported = getattr(fake_lib, func.name)
+            self.assertEqual(exported.restype, func.restype)
+            self.assertEqual(exported.argtypes, func.argtypes)
+
+    @patch("vllm_ascend.distributed.device_communicators.pyhccl_wrapper.ctypes.CDLL")
+    def test_init_uses_cached_functions_without_reloading(self, mock_cdll):
+        fake_lib = MagicMock()
+        cached_funcs = {"HcclGetErrorString": MagicMock()}
+        HCCLLibrary.path_to_library_cache["/cached/libhccl.so"] = fake_lib
+        HCCLLibrary.path_to_dict_mapping["/cached/libhccl.so"] = cached_funcs
+
+        lib = HCCLLibrary("/cached/libhccl.so")
+
+        self.assertIs(lib.lib, fake_lib)
+        self.assertIs(lib._funcs, cached_funcs)
+        mock_cdll.assert_not_called()
+
+    def test_hccl_get_error_string(self):
+        lib = HCCLLibrary.__new__(HCCLLibrary)
+        lib._funcs = {"HcclGetErrorString": MagicMock(return_value=b"HCCL internal error")}
+
+        msg = lib.hcclGetErrorString(hcclResult_t(1))
+
         self.assertEqual(msg, "HCCL internal error")
-        mock_fn.assert_called_once()
+        lib._funcs["HcclGetErrorString"].assert_called_once()
 
     def test_hccl_check(self):
         lib = HCCLLibrary.__new__(HCCLLibrary)
@@ -101,6 +144,13 @@ class TestHCLLLibrary(TestBase):
             lib.HCCL_CHECK(result)
 
         self.assertEqual(str(cm.exception), "HCCL error: fake error")
+
+    def test_hccl_check_accepts_zero(self):
+        lib = HCCLLibrary.__new__(HCCLLibrary)
+        lib.hcclGetErrorString = MagicMock()
+
+        self.assertIsNone(lib.HCCL_CHECK(0))
+        lib.hcclGetErrorString.assert_not_called()
 
     @patch.object(HCCLLibrary, "HCCL_CHECK")
     def test_hccl_get_uniqueId(self, mock_HCCL_CHECK):
